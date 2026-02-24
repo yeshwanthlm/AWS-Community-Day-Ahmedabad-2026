@@ -1,9 +1,19 @@
+"""
+Food Recommendation Agent for AgentCore Runtime
+
+This agent uses AgentCore Memory to remember user food preferences across sessions.
+Deploy this to AgentCore Runtime with the following environment variables:
+  - MEMORY_ID: Your pre-created memory resource ID (e.g., FoodAgentMemory-xyz)
+  - MODEL_ID: Bedrock model ID (e.g., us.anthropic.claude-3-5-haiku-20241022-v1:0)
+  - AWS_REGION: AWS region (e.g., us-east-1)
+"""
+
 import os
 import logging
 from datetime import datetime
-from botocore.exceptions import ClientError
 
 from strands import Agent, tool
+from strands.models import BedrockModel
 from strands.hooks import (
     AgentInitializedEvent, 
     AfterInvocationEvent,
@@ -11,72 +21,26 @@ from strands.hooks import (
     HookRegistry
 )
 from bedrock_agentcore.memory import MemoryClient
-from bedrock_agentcore.memory.constants import StrategyType
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from bedrock_agentcore.identity.auth import requires_iam_access_token
 
 from ddgs import DDGS
-from ddgs.exceptions import RatelimitException
+from ddgs.exceptions import DDGSException, RatelimitException
 
 # ==========================================
 # Configuration & Setup
 # ==========================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("food_agent_runtime")
 
+app = BedrockAgentCoreApp()
+
 REGION = os.getenv('AWS_REGION', 'us-east-1')
-client = MemoryClient(region_name=REGION)
-MEMORY_NAME = "FoodAgentMemory"
+MODEL_ID = os.getenv('MODEL_ID', 'us.anthropic.claude-3-5-haiku-20241022-v1:0')
+MEMORY_ID = os.getenv('MEMORY_ID') # Needs to be provided in environment for prod
 
-def get_or_create_memory_id() -> str:
-    """Retrieve existing Bedrock AgentCore Memory ID or initialize it."""
-    
-    # Check if memory already exists first!
-    try:
-        memories = client.list_memories(max_results=100)
-        existing_memory = next((m['id'] for m in memories if m['name'] == MEMORY_NAME), None)
-        if existing_memory:
-            logger.info(f"✅ Found existing memory '{MEMORY_NAME}': {existing_memory}")
-            return existing_memory
-    except Exception as e:
-        logger.warning(f"Failed to list existing memories: {e}")
-
-    # Fallback to create if not found
-    strategies = [
-        {
-            StrategyType.USER_PREFERENCE.value: {
-                "name": "FoodPreferences",
-                "description": "Captures food preferences including cuisines, dietary restrictions, favorite dishes",
-                "namespaces": ["user/{actorId}/food_preferences"]
-            }
-        }
-    ]
-
-    try:
-        memory = client.create_memory_and_wait(
-            name=MEMORY_NAME,
-            strategies=strategies,
-            description="Memory for food recommendation agent",
-            event_expiry_days=7,
-            max_wait=300,
-            poll_interval=10
-        )
-        logger.info(f"Created new memory: {memory['id']}")
-        return memory['id']
-        
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ValidationException' and "already exists" in str(e):
-            memories = client.list_memories()
-            memory_id = next((m['id'] for m in memories if m['name'] == MEMORY_NAME), None)
-            if memory_id:
-                logger.info(f"✅ Memory already exists. Using: {memory_id}")
-                return memory_id
-            raise ValueError(f"Memory {MEMORY_NAME} exists but ID not found in list_memories()")
-        else:
-            raise e
-
-# Initialize global memory ID for the runtime
-MEMORY_ID = get_or_create_memory_id()
-
+# Global agent instance
+agent = None
 
 # ==========================================
 # Memory Hook Provider
@@ -84,21 +48,27 @@ MEMORY_ID = get_or_create_memory_id()
 class FoodMemoryHookProvider(HookProvider):
     """Automatic memory management for food agent"""
     
-    def __init__(self, memory_client: MemoryClient, memory_id: str):
-        self.memory_client = memory_client
-        self.memory_id = memory_id
+    def __init__(self, region_name: str):
+        logger.info(f"Initializing FoodMemoryHookProvider with region {region_name}")
+        self.memory_client = MemoryClient(region_name=region_name)
     
     def on_agent_initialized(self, event: AgentInitializedEvent):
         """Load food preferences when agent starts"""
+        logger.info("Agent initialization hook triggered (FoodMemoryHookProvider)")
+
+        memory_id = event.agent.state.get("memory_id")
+        actor_id = event.agent.state.get("actor_id")
+
+        if not memory_id or not actor_id:
+            logger.warning(
+                f"Missing required state - memory_id: {memory_id}, actor_id: {actor_id}"
+            )
+            return
+
         try:
-            actor_id = event.agent.state.get("actor_id")
-            if not actor_id:
-                logger.warning("Missing actor_id in agent state. Cannot load preferences.")
-                return
-            
             namespace = f"user/{actor_id}/food_preferences"
             preferences = self.memory_client.retrieve_memories(
-                memory_id=self.memory_id,
+                memory_id=memory_id,
                 namespace=namespace,
                 query="food preferences cuisines dietary restrictions favorites",
                 top_k=5
@@ -117,23 +87,30 @@ class FoodMemoryHookProvider(HookProvider):
                 if pref_texts:
                     context = "\\n".join(pref_texts)
                     event.agent.system_prompt += f"\\n\\n## User's Food Preferences:\\n{context}"
-                    logger.info(f"Loaded {len(pref_texts)} food preferences for user: {actor_id}")
-                    
+                    logger.info(f"✅ Loaded {len(pref_texts)} food preferences for user: {actor_id}")
+            else:
+                 logger.info("No previous food preferences found - starting fresh!")
+                 
         except Exception as e:
-            logger.error(f"Error loading preferences: {e}")
+            logger.error(f"Error loading preferences: {e}", exc_info=True)
     
     def on_after_invocation(self, event: AfterInvocationEvent):
         """Save conversation after each interaction"""
+        logger.info("After invocation hook triggered (FoodMemoryHookProvider)")
+        
+        memory_id = event.agent.state.get("memory_id")
+        actor_id = event.agent.state.get("actor_id")
+        session_id = event.agent.state.get("session_id")
+
+        if not memory_id or not actor_id or not session_id:
+            logger.warning(
+                f"Missing required state for saving - memory_id: {memory_id}, actor_id: {actor_id}, session_id: {session_id}"
+            )
+            return
+
         try:
             messages = event.agent.messages
             if len(messages) < 2:
-                return
-                
-            actor_id = event.agent.state.get("actor_id")
-            session_id = event.agent.state.get("session_id")
-            
-            if not actor_id or not session_id:
-                logger.warning("Missing actor_id or session_id. Cannot save conversation.")
                 return
             
             user_msg = None
@@ -153,20 +130,20 @@ class FoodMemoryHookProvider(HookProvider):
             
             if user_msg and assistant_msg:
                 self.memory_client.create_event(
-                    memory_id=self.memory_id,
+                    memory_id=memory_id,
                     actor_id=actor_id,
                     session_id=session_id,
                     messages=[(user_msg, "USER"), (assistant_msg, "ASSISTANT")]
                 )
-                logger.debug(f"Saved conversation event for session: {session_id}")
+                logger.info(f"💾 Saved conversation event to memory for session: {session_id}")
                 
         except Exception as e:
-            logger.error(f"Error saving conversation: {e}")
+            logger.error(f"Error saving conversation: {e}", exc_info=True)
     
     def register_hooks(self, registry: HookRegistry):
+        logger.info("Registering food memory hooks")
         registry.add_callback(AgentInitializedEvent, self.on_agent_initialized)
         registry.add_callback(AfterInvocationEvent, self.on_after_invocation)
-        logger.info("Food memory hooks registered")
 
 
 # ==========================================
@@ -187,7 +164,9 @@ def search_food(query: str, max_results: int = 5) -> str:
         
         formatted = []
         for i, r in enumerate(results, 1):
-            formatted.append(f"{i}. {r.get('title', 'No title')}\\n   {r.get('body', '')}")
+            title = r.get("title", "No title")
+            body = r.get("body", "")
+            formatted.append(f"{i}. {title}\\n   {body}")
         
         return "\\n\\n".join(formatted)
     except RatelimitException:
@@ -195,59 +174,109 @@ def search_food(query: str, max_results: int = 5) -> str:
     except Exception as e:
         return f"Search error: {str(e)}"
 
-@tool
-@requires_iam_access_token(
-    audience=["https://api.example-restaurant.com/v1/*"], 
-    signing_algorithm="ES384",
-    duration_seconds=300
-)
-async def book_restaurant(restaurant_id: str, date: str, time: str, guests: int, *, access_token: str) -> str:
-    """Book a table at a restaurant. Requires an IAM Access Token injected by AgentCore Identity.
-    
-    Args:
-        restaurant_id: The ID of the restaurant.
-        date: The date for the booking (YYYY-MM-DD).
-        time: The time for the booking (HH:MM).
-        guests: The number of guests.
-        access_token: The signed JWT access token injected by the decorator. (DO NOT PASS THIS)
-    """
-    logger.info(f"[Identity] Injected AWS STS JWT Access Token (length: {len(access_token)}).")
-    logger.info(f"[Policy Gateway] Verifying token & identity for booking at {restaurant_id}...")
-    return f"Successfully booked {guests} guests at {restaurant_id} for {date} at {time} using IAM JWT authentication."
 
+def get_system_prompt() -> str:
+    """Generate the system prompt for the food agent"""
+    return f"""You are a concise food assistant. Help users discover new foods & remember their preferences. 
+You can search the web for recipes using `search_food` and book restaurants securely using `book_restaurant`. 
+Date: {datetime.today().strftime("%Y-%m-%d")}"""
 
 # ==========================================
 # Core Agent Creator
 # ==========================================
-def create_food_agent(user_id: str, session_id: str) -> Agent:
-    """
-    Create a food recommendation agent integrated with AgentCore Memory and Tools.
-    This factory function is typically invoked per-request context in runtime environments.
-    """
-    
-    system_prompt = f"""You are a concise food assistant. Help users discover new foods & remember their preferences. 
-You can search the web for recipes using `search_food` and book restaurants securely using `book_restaurant`. 
-Date: {datetime.today().strftime("%Y-%m-%d")}"""
-    
-    memory_hooks = FoodMemoryHookProvider(client, MEMORY_ID)
-    
-    agent = Agent(
-        name="FoodieBuddy",
-        model="us.anthropic.claude-3-5-haiku-20241022-v1:0",
-        system_prompt=system_prompt,
-        hooks=[memory_hooks],
-        tools=[search_food, book_restaurant],
-        state={
-            "actor_id": user_id, 
-            "session_id": session_id
-        }
+def initialize_agent(actor_id: str, session_id: str):
+    """Initialize the food agent with memory hooks"""
+    global agent
+
+    logger.info(
+        f"Initializing food agent for actor_id={actor_id}, session_id={session_id}"
     )
-    
-    logger.info(f"Agent instantiated for User: {user_id} | Session: {session_id}")
-    return agent
+
+    logger.info(f"Creating BedrockModel with ID: {MODEL_ID}")
+    model = BedrockModel(model_id=MODEL_ID)
+
+    logger.info(f"Creating memory hook with region: {REGION}")
+    memory_hook = FoodMemoryHookProvider(region_name=REGION)
+
+    agent = Agent(
+        model=model,
+        hooks=[memory_hook],
+        tools=[search_food, book_restaurant],
+        system_prompt=get_system_prompt(),
+        state={
+            "memory_id": MEMORY_ID, 
+            "actor_id": actor_id, 
+            "session_id": session_id
+        },
+    )
+
+    logger.info(f"✅ Food agent initialized with state: {agent.state.get()}")
+
+# ==========================================
+# Bedrock AgentCore Runtime Entrypoint
+# ==========================================
+@app.entrypoint
+def food_agent(payload: dict, context):
+    """
+    Main entry point for the food recommendation agent.
+
+    Expected payload:
+    {
+        "prompt": "User's message",
+        "actor_id": "unique_user_id"  # Optional, defaults to "default_user"
+    }
+
+    The session_id comes from context.session_id (managed by AgentCore Runtime)
+    """
+    global agent
+
+    logger.info(f"Received payload: {payload}")
+    logger.info(f"Context session_id: {context.session_id}")
+    print(f"Session ID: {context.session_id}")
+
+    # Extract values from payload
+    user_input = payload.get("prompt")
+    actor_id = payload.get("actor_id", "default_user")
+    session_id = context.session_id
+
+    print(f"Actor ID: {actor_id}")
+    print(f"Memory ID: {MEMORY_ID}")
+
+    # Validate required fields
+    if not user_input:
+        error_msg = "❌ ERROR: Missing 'prompt' field in payload"
+        logger.error(error_msg)
+        return error_msg
+
+    if not MEMORY_ID:
+        error_msg = "❌ ERROR: MEMORY_ID environment variable not set. Please deploy properly to Agent Core runtime."
+        logger.error(error_msg)
+        return error_msg
+
+    # Initialize agent on first request or if session changed
+    if agent is None:
+        logger.info("First request - initializing agent")
+        initialize_agent(actor_id, session_id)
+    else:
+        # Update state if actor_id or session_id changed
+        current_session = agent.state.get("session_id")
+        current_actor = agent.state.get("actor_id")
+
+        if current_session != session_id or current_actor != actor_id:
+            logger.info(f"Session or actor changed - reinitializing agent")
+            initialize_agent(actor_id, session_id)
+
+    # Invoke the agent
+    logger.info(f"Invoking agent with input: {user_input}")
+    response = agent(user_input)
+
+    # Extract response text
+    response_text = response.message["content"][0]["text"]
+    logger.info(f"✅ Agent response: {response_text[:100]}...")
+
+    return response_text
 
 
-# In a production AWS AgentCore setup, this `create_food_agent` factory function
-# would be invoked by your runtime handler (like a FastAPI endpoint or Lambda handler),
-# extracting the `user_id` and `session_id` from the incoming request payload,
-# and streaming the agent response back to the user.
+if __name__ == "__main__":
+    logger.info("Starting Food Agent on Bedrock AgentCore Runtime")
+    app.run()
