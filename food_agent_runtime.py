@@ -28,7 +28,19 @@ client = MemoryClient(region_name=REGION)
 MEMORY_NAME = "FoodAgentMemory"
 
 def get_or_create_memory_id() -> str:
-    """Initialize or retrieve the Bedrock AgentCore Memory ID."""
+    """Retrieve existing Bedrock AgentCore Memory ID or initialize it."""
+    
+    # Check if memory already exists first!
+    try:
+        memories = client.list_memories(max_results=100)
+        existing_memory = next((m['id'] for m in memories if m['name'] == MEMORY_NAME), None)
+        if existing_memory:
+            logger.info(f"✅ Found existing memory '{MEMORY_NAME}': {existing_memory}")
+            return existing_memory
+    except Exception as e:
+        logger.warning(f"Failed to list existing memories: {e}")
+
+    # Fallback to create if not found
     strategies = [
         {
             StrategyType.USER_PREFERENCE.value: {
@@ -48,15 +60,15 @@ def get_or_create_memory_id() -> str:
             max_wait=300,
             poll_interval=10
         )
-        logger.info(f"Created memory: {memory['id']}")
+        logger.info(f"Created new memory: {memory['id']}")
         return memory['id']
         
     except ClientError as e:
         if e.response['Error']['Code'] == 'ValidationException' and "already exists" in str(e):
             memories = client.list_memories()
-            memory_id = next((m['id'] for m in memories if m['id'].startswith(MEMORY_NAME)), None)
+            memory_id = next((m['id'] for m in memories if m['name'] == MEMORY_NAME), None)
             if memory_id:
-                logger.info(f"Memory already exists. Using: {memory_id}")
+                logger.info(f"✅ Memory already exists. Using: {memory_id}")
                 return memory_id
             raise ValueError(f"Memory {MEMORY_NAME} exists but ID not found in list_memories()")
         else:
