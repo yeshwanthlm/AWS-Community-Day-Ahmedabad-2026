@@ -247,22 +247,7 @@ Date: {datetime.today().strftime("%Y-%m-%d")}"""
     return agent
 
 
-if __name__ == "__main__":
-    import asyncio
-    
-    # Simple Local Test Execution
-    async def main():
-        user_id = "food-lover-001"
-        session_id = f"food_chat_runtime_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
-        agent = create_food_agent(user_id, session_id)
-        
-        prompt = "Hi! I'm hungry. Can you recommend some Thai food and try booking a table for me at 'thai-palace-123' for tonight at 8 PM for 2 guests? Keep in mind I have a peanut allergy!"
-        print(f"\\nUser: {prompt}")
-        print("Agent Computing...")
-        
-        # Invoke Agent
-        response = await agent.invoke_async(prompt)
-        print(f"\\nAgent: {response.output}")
-        
-    asyncio.run(main())
+# In a production AWS AgentCore setup, this `create_food_agent` factory function
+# would be invoked by your runtime handler (like a FastAPI endpoint or Lambda handler),
+# extracting the `user_id` and `session_id` from the incoming request payload,
+# and streaming the agent response back to the user.
