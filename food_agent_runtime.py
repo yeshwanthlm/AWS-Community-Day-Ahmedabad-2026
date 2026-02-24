@@ -177,7 +177,7 @@ def search_food(query: str, max_results: int = 5) -> str:
 def get_system_prompt() -> str:
     """Generate the system prompt for the food agent"""
     return f"""You are a concise food assistant. Help users discover new foods & remember their preferences. 
-You can search the web for recipes using `search_food` and book restaurants securely using `book_restaurant`. 
+You can search the web for recipes using `search_food`. 
 Date: {datetime.today().strftime("%Y-%m-%d")}"""
 
 # ==========================================
@@ -200,7 +200,7 @@ def initialize_agent(actor_id: str, session_id: str):
     agent = Agent(
         model=model,
         hooks=[memory_hook],
-        tools=[search_food, book_restaurant],
+        tools=[search_food],
         system_prompt=get_system_prompt(),
         state={
             "memory_id": MEMORY_ID, 
