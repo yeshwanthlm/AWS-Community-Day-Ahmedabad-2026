@@ -22,7 +22,6 @@ from strands.hooks import (
 )
 from bedrock_agentcore.memory import MemoryClient
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from bedrock_agentcore.identity.auth import requires_iam_access_token
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException, RatelimitException
@@ -37,7 +36,7 @@ app = BedrockAgentCoreApp()
 
 REGION = os.getenv('AWS_REGION', 'us-east-1')
 MODEL_ID = os.getenv('MODEL_ID', 'us.anthropic.claude-3-5-haiku-20241022-v1:0')
-MEMORY_ID = os.getenv('MEMORY_ID') # Needs to be provided in environment for prod
+MEMORY_ID = os.getenv('MEMORY_ID', 'FoodAgentMemory-2SXptmCV1E') # Needs to be provided in environment for prod
 
 # Global agent instance
 agent = None
